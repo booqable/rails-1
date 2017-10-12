@@ -141,6 +141,8 @@ module ActiveRecord
 
     included do
       Associations::Builder::Association.extensions << AssociationBuilderExtension
+      mattr_accessor :index_nested_attribute_errors, instance_writer: false
+      self.index_nested_attribute_errors = false
     end
 
     module ClassMethods
@@ -198,7 +200,7 @@ module ActiveRecord
             after_create save_method
             after_update save_method
           else
-            define_non_cyclic_method(save_method) { save_belongs_to_association(reflection) }
+            define_non_cyclic_method(save_method) { throw(:abort) if save_belongs_to_association(reflection) == false }
             before_save save_method
           end
 
@@ -214,7 +216,13 @@ module ActiveRecord
               method = :validate_single_association
             end
 
-            define_non_cyclic_method(validation_method) { send(method, reflection) }
+            define_non_cyclic_method(validation_method) do
+              send(method, reflection)
+              # TODO: remove the following line as soon as the return value of
+              # callbacks is ignored, that is, returning `false` does not
+              # display a deprecation warning or halts the callback chain.
+              true
+            end
             validate validation_method
           end
         end
@@ -271,9 +279,9 @@ module ActiveRecord
         if new_record
           association && association.target
         elsif autosave
-          association.target.find_all { |record| record.changed_for_autosave? }
+          association.target.find_all(&:changed_for_autosave?)
         else
-          association.target.find_all { |record| record.new_record? }
+          association.target.find_all(&:new_record?)
         end
       end
 
@@ -308,8 +316,10 @@ module ActiveRecord
       # +reflection+.
       def validate_collection_association(reflection)
         if association = association_instance_get(reflection.name)
+          all_records = association.target.find_all.to_a
+
           if records = associated_records_to_validate_or_save(association, new_record?, reflection.options[:autosave])
-            records.each { |record| association_valid?(reflection, record) }
+            records.each { |record| association_valid?(reflection, record, all_records.index(record)) }
           end
         end
       end
@@ -317,14 +327,18 @@ module ActiveRecord
       # Returns whether or not the association is valid and applies any errors to
       # the parent, <tt>self</tt>, if it wasn't. Skips any <tt>:autosave</tt>
       # enabled records if they're marked_for_destruction? or destroyed.
-      def association_valid?(reflection, record)
-        return true if record.destroyed? || (reflection.options[:autosave] && record.marked_for_destruction?)
+      def association_valid?(reflection, record, index=nil)
+        return true if record.destroyed? || record.marked_for_destruction?
 
         validation_context = self.validation_context unless [:create, :update].include?(self.validation_context)
         unless valid = record.valid?(validation_context)
           if reflection.options[:autosave]
             record.errors.each do |attribute, message|
-              attribute = "#{reflection.name}.#{attribute}"
+              if index.nil? || (!reflection.options[:index_errors] && !ActiveRecord::Base.index_nested_attribute_errors)
+                attribute = "#{reflection.name}.#{attribute}"
+              else
+                attribute = "#{reflection.name}[#{index}].#{attribute}"
+              end
               errors[attribute] << message
               errors[attribute].uniq!
             end
